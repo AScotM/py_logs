@@ -20,6 +20,7 @@ import json
 import csv
 from contextlib import contextmanager
 import time
+import psutil
 
 try:
     from rich.console import Console
@@ -83,8 +84,10 @@ class SizedTTLCache:
         return wrapper
     
     def _cleanup(self, now):
-        expired = [k for k, (_, timestamp) in self._cache.items() 
-                  if now - timestamp > self.ttl]
+        expired = []
+        for key, (_, timestamp) in list(self._cache.items()):
+            if now - timestamp > self.ttl:
+                expired.append(key)
         for key in expired:
             del self._cache[key]
 
@@ -107,15 +110,12 @@ class AuditLogger:
         except IOError:
             logging.warning(f"Audit: {username} {action} {log_file}")
 
-@dataclass
 class PerformanceMetrics:
-    start_time: float
-    lines_processed: int = 0
-    entries_parsed: int = 0
-    bytes_read: int = 0
-    pattern_matches: Dict[str, int] = None
-    
-    def __post_init__(self):
+    def __init__(self, start_time: float):
+        self.start_time = start_time
+        self.lines_processed = 0
+        self.entries_parsed = 0
+        self.bytes_read = 0
         self.pattern_matches = defaultdict(int)
     
     def get_summary(self) -> Dict[str, Any]:
@@ -129,7 +129,6 @@ class PerformanceMetrics:
         }
 
 class RSyslogInfo:
-    
     def __init__(self):
         self.version = None
         self.features = {}
@@ -160,7 +159,6 @@ class RSyslogInfo:
         
         for line in lines:
             line = line.strip()
-            
             if line.startswith('Config file:'):
                 self.config_file = line.split(':', 1)[1].strip()
             elif line.startswith('PID file:'):
@@ -187,7 +185,6 @@ class RSyslogInfo:
                                   capture_output=True, text=True)
             if result.returncode == 0:
                 self.version = "unknown (running)"
-                
                 possible_configs = [
                     "/etc/rsyslog.conf",
                     "/etc/rsyslog.d/",
@@ -197,16 +194,13 @@ class RSyslogInfo:
                     if os.path.exists(config):
                         self.config_file = config
                         break
-                
                 return True
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
-            
         return False
     
     def get_recommended_patterns(self) -> List[Tuple[Pattern, str, str]]:
         patterns = []
-        
         patterns.extend([
             (
                 re.compile(
@@ -266,16 +260,13 @@ class RSyslogInfo:
                     "RainerScript enhanced format"
                 )
             )
-        
         return patterns
     
     def _version_compare(self, v1: str, v2: str) -> int:
         def normalize(v):
             return [int(x) for x in re.sub(r'[^0-9.]', '', v).split('.')]
-        
         v1_norm = normalize(v1)
         v2_norm = normalize(v2)
-        
         for i in range(max(len(v1_norm), len(v2_norm))):
             v1_part = v1_norm[i] if i < len(v1_norm) else 0
             v2_part = v2_norm[i] if i < len(v2_norm) else 0
@@ -285,70 +276,65 @@ class RSyslogInfo:
     
     def get_config_recommendations(self) -> Dict[str, Any]:
         recommendations = {}
-        
         if self.version and self._version_compare(self.version, "8.0") < 0:
             recommendations['version'] = "Consider upgrading to rsyslog 8.x+ for better features"
-        
         if not self.features.get('FEATURE_REGEXP', False):
             recommendations['regexp'] = "Rebuild rsyslog with regexp support for better parsing"
-        
         if self.config_file and os.path.exists(self.config_file):
             try:
                 with open(self.config_file, 'r') as f:
                     config_content = f.read()
-                    
                 if 'imfile' not in config_content:
                     recommendations['imfile'] = "Consider enabling imfile module for file monitoring"
                 if 'omelasticsearch' in config_content:
                     recommendations['elastic'] = "Elasticsearch output detected - consider using elastic tools"
-                    
             except (IOError, PermissionError):
                 pass
-        
         return recommendations
 
-@dataclass
 class AnalyzerConfig:
-    max_days: int = 30
-    truncate_length: int = 80
-    show_full_lines: bool = False
-    wrap_lines: bool = False
-    max_lines_per_service: int = 5
-    color_output: bool = True
-    verbose: bool = False
-    enable_analysis: bool = False
-    max_file_size_mb: int = 100
-    use_rsyslog_detection: bool = True
-    max_memory_entries: int = 100000
+    def __init__(self, max_days: int = 30, truncate_length: int = 80, show_full_lines: bool = False,
+                 wrap_lines: bool = False, max_lines_per_service: int = 5, color_output: bool = True,
+                 verbose: bool = False, enable_analysis: bool = False, max_file_size_mb: int = 100,
+                 use_rsyslog_detection: bool = True, max_memory_entries: int = 100000):
+        self.max_days = max_days
+        self.truncate_length = truncate_length
+        self.show_full_lines = show_full_lines
+        self.wrap_lines = wrap_lines
+        self.max_lines_per_service = max_lines_per_service
+        self.color_output = color_output
+        self.verbose = verbose
+        self.enable_analysis = enable_analysis
+        self.max_file_size_mb = max_file_size_mb
+        self.use_rsyslog_detection = use_rsyslog_detection
+        self.max_memory_entries = max_memory_entries
     
     @classmethod
     def from_file(cls, config_path: Path) -> "AnalyzerConfig":
         if not config_path.exists():
             return cls()
-        
         if not cls._is_safe_config_path(config_path):
             raise SecurityError(f"Config file path not allowed: {config_path}")
-        
         try:
             with open(config_path, 'r') as f:
                 config_data = json.load(f)
-            
             validated_data = cls._validate_config(config_data)
             return cls(**validated_data)
-            
         except (json.JSONDecodeError, KeyError, ValueError) as e:
             logging.error(f"Invalid configuration file {config_path}: {e}")
             return cls()
 
     @staticmethod
     def _is_safe_config_path(path: Path) -> bool:
-        safe_locations = [Path('.'), Path.home() / '.config', Path('/etc/syslog-analyzer')]
-        return any(path.resolve().is_relative_to(safe.resolve()) for safe in safe_locations)
+        safe_locations = [Path('.').resolve(), 
+                         (Path.home() / '.config').resolve(), 
+                         Path('/etc/syslog-analyzer')]
+        resolved_path = path.resolve()
+        return any(resolved_path.is_relative_to(safe.resolve()) for safe in safe_locations)
 
     @staticmethod
     def _validate_config(config_data: Dict) -> Dict:
         validated = {}
-        
         constraints = {
             'max_days': (1, 365),
             'truncate_length': (10, 1000),
@@ -356,7 +342,6 @@ class AnalyzerConfig:
             'max_file_size_mb': (1, 1024),
             'max_memory_entries': (1000, 1000000)
         }
-        
         for key, value in config_data.items():
             if key in constraints:
                 min_val, max_val = constraints[key]
@@ -369,7 +354,6 @@ class AnalyzerConfig:
                 validated[key] = bool(value)
             else:
                 logging.warning(f"Unknown config key: {key}")
-        
         return validated
 
 class ErrorDetector:
@@ -436,7 +420,6 @@ class ErrorClusterPlugin(AnalysisPlugin):
         }
 
 class LogParser:
-    
     def __init__(self, current_year: int, verbose: bool = False, use_rsyslog_detection: bool = True):
         self.current_year = current_year
         self.verbose = verbose
@@ -514,22 +497,19 @@ class LogParser:
         self.last_year = year
         return year
     
-    @lru_cache(maxsize=1000)
+    @lru_cache(maxsize=10000)
     def _parse_iso_timestamp(self, ts_str: str) -> Optional[datetime]:
         ts_str = ts_str.replace(' ', 'T')
-        
         formats = [
             "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ",
             "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"
         ]
-        
         for fmt in formats:
             try:
                 return datetime.strptime(ts_str, fmt)
             except ValueError:
                 continue
-        
         return None
     
     def parse_line(self, line: str, now: datetime, cutoff_date: datetime, metrics: PerformanceMetrics = None) -> Optional[LogEntry]:
@@ -581,13 +561,10 @@ class LogParser:
     def _is_likely_log_line(self, line: str) -> bool:
         if not line or len(line) < 15:
             return False
-        
         if line[:3] in MONTHS:
             return True
-        
         if re.match(r'^\d{4}-\d{2}-\d{2}', line):
             return True
-        
         return False
     
     def _extract_timestamp(self, group_dict: Dict[str, str], pattern_type: str) -> Optional[datetime]:
@@ -621,7 +598,6 @@ class LogParser:
             "pattern_types": [pt[1] for pt in self._compiled_patterns],
             "pattern_descriptions": [pt[2] for pt in self._compiled_patterns]
         }
-        
         if self.rsyslog_info:
             info["rsyslog_detected"] = True
             info["rsyslog_version"] = self.rsyslog_info.version
@@ -629,11 +605,13 @@ class LogParser:
             info["recommendations"] = self.rsyslog_info.get_config_recommendations()
         else:
             info["rsyslog_detected"] = False
-            
         return info
 
 class RSyslogAnalyzer:
     def __init__(self, log_file: Optional[str] = None, config: AnalyzerConfig = None):
+        if log_file and not self._is_safe_path(log_file):
+            raise SecurityError(f"Unsafe log file path: {log_file}")
+            
         self.tree: Dict[str, Dict[str, List[LogEntry]]] = defaultdict(lambda: defaultdict(list))
         self.config = config or AnalyzerConfig()
         self.log_file = log_file or self._find_log_file()
@@ -648,11 +626,12 @@ class RSyslogAnalyzer:
         self._parsed_entries = 0
         self._memory_warning_issued = False
         
-        self.audit_logger.log_access(
-            os.getenv('USER', 'unknown'), 
-            self.log_file or 'auto-detected', 
-            'analyzer_start'
-        )
+        if self.log_file:
+            self.audit_logger.log_access(
+                os.getenv('USER', 'unknown'), 
+                self.log_file, 
+                'analyzer_start'
+            )
 
     def _is_readable_log(self, path: str) -> bool:
         path_obj = Path(path)
@@ -667,28 +646,22 @@ class RSyslogAnalyzer:
 
     def _find_log_file(self) -> Optional[str]:
         candidates = []
-        
         for path in DEFAULT_SYSLOG_PATHS:
             if self._is_readable_log(path):
                 candidates.append((path, os.path.getmtime(path)))
-            
             patterns = [f"{path}.{ext}" for ext in ["1", "2", "3", "0"]] + \
                       [f"{path}-{date}" for date in self._get_recent_dates()]
-            
             for pattern in patterns:
                 if self._is_readable_log(pattern):
                     candidates.append((pattern, os.path.getmtime(pattern)))
-        
         for candidate_path, _ in candidates[:]:
             for ext in ['.gz', '.bz2', '.xz']:
                 compressed_path = candidate_path + ext
                 if self._is_readable_log(compressed_path):
                     candidates.append((compressed_path, os.path.getmtime(compressed_path)))
-        
         if not candidates:
             logging.error("No standard syslog file found or insufficient permissions.")
             return None
-        
         candidates.sort(key=lambda x: x[1], reverse=True)
         selected = candidates[0][0]
         logging.info(f"Using log file: {selected}")
@@ -697,21 +670,17 @@ class RSyslogAnalyzer:
     def _is_safe_path(self, path: str) -> bool:
         try:
             resolved = Path(path).resolve(strict=True)
-            
             current = resolved
-            while current != current.parent:
+            while current != Path('/'):
                 if current.is_symlink():
                     return False
                 current = current.parent
-            
             allowed_dirs = [
                 Path('/var/log'),
                 Path('/var/log/rsyslog'),
                 Path('/var/log/syslog.d')
             ]
-            
             return any(resolved.is_relative_to(allowed) for allowed in allowed_dirs)
-            
         except (OSError, RuntimeError):
             return False
 
@@ -719,13 +688,12 @@ class RSyslogAnalyzer:
     def _open_log_file(self, file_path: str):
         try:
             resolved_path = os.path.realpath(file_path)
-            
             if not self._is_safe_path(resolved_path):
                 raise SecurityError(f"Access to {file_path} not allowed")
             
-            file_size_mb = os.path.getsize(resolved_path) / (1024 * 1024)
-            if file_size_mb > self.config.max_file_size_mb:
-                raise SecurityError(f"File too large: {file_size_mb:.1f}MB > {self.config.max_file_size_mb}MB limit")
+            file_size = os.path.getsize(resolved_path)
+            if file_size > self.config.max_file_size_mb * 1024 * 1024:
+                raise SecurityError(f"File size {file_size} exceeds limit")
             
             try:
                 if file_path.endswith('.gz'):
@@ -740,12 +708,10 @@ class RSyslogAnalyzer:
                 else:
                     with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                         yield f
-                        
             except (gzip.BadGzipFile, bz2.BZ2Error, lzma.LZMAError) as e:
                 raise ValueError(f"Corrupted compressed file {file_path}: {e}")
             except UnicodeDecodeError as e:
                 raise ValueError(f"Encoding error in {file_path}: {e}")
-                
         except (FileNotFoundError, PermissionError, SecurityError) as e:
             logging.error(f"Cannot read log file {file_path}: {e}")
             raise
@@ -768,7 +734,6 @@ class RSyslogAnalyzer:
                     if lines_processed >= max_lines:
                         logging.warning(f"Reached maximum lines limit ({max_lines})")
                         break
-                        
                     lines_processed += 1
                     try:
                         entry = self.parser.parse_line(line.strip(), now, cutoff_date)
@@ -778,7 +743,6 @@ class RSyslogAnalyzer:
                         if self.config.verbose:
                             logging.debug(f"Parse error in line: {e}")
                         continue
-                        
         except (FileNotFoundError, PermissionError, SecurityError, ValueError) as e:
             logging.error(f"Cannot read log file: {e}")
 
@@ -798,7 +762,6 @@ class RSyslogAnalyzer:
             return
         
         show_progress = self.config.color_output and file_size > 1024 * 1024 and RICH_AVAILABLE
-        
         metrics = PerformanceMetrics(start_time=time.time())
         
         try:
@@ -844,6 +807,10 @@ class RSyslogAnalyzer:
                 progress.update(task, advance=100)
 
     def _process_entry(self, entry: LogEntry):
+        process = psutil.Process()
+        if process.memory_info().rss > 500 * 1024 * 1024:
+            logging.warning("Memory usage high, consider increasing max_memory_entries")
+        
         if self._parsed_entries >= self.config.max_memory_entries:
             if not self._memory_warning_issued:
                 logging.warning(f"Memory limit reached ({self.config.max_memory_entries} entries). Stopping processing.")
@@ -863,30 +830,24 @@ class RSyslogAnalyzer:
     def _update_analysis(self, entry: LogEntry):
         self.analysis_results.total_entries += 1
         self.analysis_results.unique_services.add(entry.service)
-        
         if entry.level:
             self.analysis_results.level_distribution[entry.level.upper()] += 1
-        
         if entry.is_error:
             self.analysis_results.error_count += 1
-        
         hour_key = entry.timestamp.strftime("%H:00")
         self.analysis_results.hourly_distribution[hour_key] += 1
-        
         self.analysis_results.service_counts[entry.service] += 1
 
     def build_tree(self):
         for date_key, services in self.tree.items():
             for service, logs in services.items():
                 services[service] = sorted(logs, key=lambda x: x.timestamp)
-        
         if self.tree and self.config.enable_analysis:
             dates = sorted(self.tree.keys())
             self.analysis_results.date_range = (dates[0], dates[-1])
 
     def display_system_info(self):
         parser_info = self.parser.get_parser_info()
-        
         if self.config.color_output and RICH_AVAILABLE:
             self._display_rich_system_info(parser_info)
         else:
@@ -894,26 +855,20 @@ class RSyslogAnalyzer:
 
     def _display_rich_system_info(self, parser_info: Dict[str, Any]):
         console.print(Panel("System Information", style="bold blue"))
-        
         table = Table(show_header=True, header_style="bold magenta")
         table.add_column("Setting", style="cyan")
         table.add_column("Value", style="white")
-        
         table.add_row("Patterns loaded", str(parser_info["patterns_loaded"]))
         table.add_row("Pattern types", ", ".join(parser_info["pattern_types"]))
         table.add_row("RSyslog detected", "Yes" if parser_info["rsyslog_detected"] else "No")
-        
         if parser_info["rsyslog_detected"]:
             table.add_row("RSyslog version", parser_info["rsyslog_version"])
             table.add_row("RainerScript bits", str(self.parser.rsyslog_info.rainerscript_bits))
-        
         console.print(table)
-        
         if parser_info["pattern_descriptions"]:
             console.print(Panel("Loaded Pattern Descriptions", style="green"))
             for i, desc in enumerate(parser_info["pattern_descriptions"], 1):
                 console.print(f"  {i}. {desc}")
-        
         if parser_info.get("recommendations"):
             console.print(Panel("Recommendations", style="yellow"))
             for key, recommendation in parser_info["recommendations"].items():
@@ -924,15 +879,12 @@ class RSyslogAnalyzer:
         print(f"  Patterns loaded: {parser_info['patterns_loaded']}")
         print(f"  Pattern types: {', '.join(parser_info['pattern_types'])}")
         print(f"  RSyslog detected: {'Yes' if parser_info['rsyslog_detected'] else 'No'}")
-        
         if parser_info["rsyslog_detected"]:
             print(f"  RSyslog version: {parser_info['rsyslog_version']}")
             print(f"  RainerScript bits: {self.parser.rsyslog_info.rainerscript_bits}")
-        
         print("\nPattern Descriptions:")
         for i, desc in enumerate(parser_info["pattern_descriptions"], 1):
             print(f"  {i}. {desc}")
-        
         if parser_info.get("recommendations"):
             print("\nRecommendations:")
             for key, recommendation in parser_info["recommendations"].items():
@@ -952,44 +904,34 @@ class RSyslogAnalyzer:
         for date in sorted(self.tree.keys()):
             self._print_line(f"\n{date}", style="bold yellow")
             services = self.tree[date]
-            
             for service in sorted(services.keys()):
                 logs = services[service]
                 error_count = sum(1 for log in logs if log.is_error)
-                
                 service_display = service
                 if error_count > 0:
                     service_display += f" [errors: {error_count}]"
-                
                 self._print_line(f"├── {service_display}", style="bold cyan")
                 self._display_service_logs(logs)
-
         print()
 
     def _display_service_logs(self, logs: List[LogEntry]):
         displayed_count = min(len(logs), self.config.max_lines_per_service)
-        
         for i, log in enumerate(logs[:self.config.max_lines_per_service]):
             is_last = i == displayed_count - 1
             prefix = "│   └── " if is_last else "│   ├── "
-            
             self._display_log_entry(log, prefix, is_last)
-        
         if len(logs) > self.config.max_lines_per_service:
             overflow_count = len(logs) - self.config.max_lines_per_service
             error_count = sum(1 for log in logs[self.config.max_lines_per_service:] if log.is_error)
-            
             overflow_msg = f"... ({overflow_count} more logs"
             if error_count > 0:
                 overflow_msg += f", {error_count} errors"
             overflow_msg += ")"
-            
             self._print_line(f"│   └── {overflow_msg}", style="dim")
 
     def _display_log_entry(self, log: LogEntry, prefix: str, is_last: bool):
         timestamp = log.timestamp.strftime("%H:%M:%S")
         level_indicator = f"[{log.level}] " if log.level else ""
-        
         if self.config.show_full_lines:
             message_lines = [log.message]
             truncation = ""
@@ -1000,10 +942,8 @@ class RSyslogAnalyzer:
         else:
             message_lines = [log.message[:self.config.truncate_length]]
             truncation = "..." if len(log.message) > self.config.truncate_length else ""
-        
         first_line = f"{prefix}[{timestamp}] {level_indicator}{message_lines[0]}{truncation}"
         self._print_line(first_line, style=self._get_style_for_log(log))
-        
         if self.config.wrap_lines and len(message_lines) > 1:
             for line in message_lines[1:]:
                 connector = "       " if is_last else "│      "
@@ -1018,11 +958,9 @@ class RSyslogAnalyzer:
                 'CRIT': 'bold red', 'CRITICAL': 'bold red'
             }
             return level_styles.get(log.level.upper(), 'white')
-        
         error_indicators = ['error', 'failed', 'failure', 'exception', 'critical']
         if any(indicator in log.message.lower() for indicator in error_indicators):
             return 'red'
-        
         return 'white'
 
     def display_summary(self):
@@ -1039,29 +977,22 @@ class RSyslogAnalyzer:
         table = Table(show_header=True, header_style="bold magenta")
         table.add_column("Metric", style="cyan")
         table.add_column("Value", style="white")
-        
         table.add_row("Total entries", f"{self.analysis_results.total_entries:,}")
         table.add_row("Unique services", str(len(self.analysis_results.unique_services)))
         table.add_row("Date range", f"{self.analysis_results.date_range[0]} to {self.analysis_results.date_range[1]}")
         table.add_row("Days with logs", str(len(self.tree)))
         table.add_row("Error count", f"{self.analysis_results.error_count:,}")
-        
         top_services = self.analysis_results.service_counts.most_common(5)
         services_str = ", ".join([f"{s[0]} ({s[1]:,})" for s in top_services])
         table.add_row("Top services", services_str)
-        
         console.print(Panel(table, title="Log Analysis Summary", style="bold blue"))
-        
         if self.analysis_results.level_distribution:
             level_table = Table(show_header=True, header_style="bold green")
             level_table.add_column("Level", style="cyan")
             level_table.add_column("Count", style="white")
-            
             for level, count in self.analysis_results.level_distribution.most_common():
                 level_table.add_row(level, f"{count:,}")
-            
             console.print(Panel(level_table, title="Log Level Distribution", style="green"))
-        
         for plugin in self.plugins:
             results = plugin.get_results()
             if results:
@@ -1074,10 +1005,8 @@ class RSyslogAnalyzer:
         print(f"  Date range: {self.analysis_results.date_range[0]} to {self.analysis_results.date_range[1]}")
         print(f"  Days with logs: {len(self.tree)}")
         print(f"  Error count: {self.analysis_results.error_count:,}")
-        
         top_services = self.analysis_results.service_counts.most_common(5)
         print(f"  Top services: {', '.join([f'{s[0]} ({s[1]:,})' for s in top_services])}")
-        
         if self.analysis_results.level_distribution:
             print(f"  Level distribution:")
             for level, count in self.analysis_results.level_distribution.most_common():
@@ -1085,7 +1014,6 @@ class RSyslogAnalyzer:
 
     def export_to_json(self, filename: str):
         parser_info = self.parser.get_parser_info()
-        
         export_data = {
             "metadata": {
                 "exported_at": datetime.now().isoformat(),
@@ -1105,29 +1033,23 @@ class RSyslogAnalyzer:
             "hourly_distribution": dict(self.analysis_results.hourly_distribution.most_common()),
             "plugin_results": {plugin.__class__.__name__: plugin.get_results() for plugin in self.plugins}
         }
-        
         with open(filename, 'w') as f:
             json.dump(export_data, f, indent=2)
-        
         logging.info(f"Exported analysis to {filename}")
 
     def export_to_csv(self, filename: str):
         with open(filename, 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['Timestamp', 'Service', 'Level', 'Host', 'PID', 'Message'])
-            
-            for date_services in self.tree.values():
-                for service, logs in date_services.items():
-                    for log in logs:
-                        writer.writerow([
-                            log.timestamp.isoformat(),
-                            service,
-                            log.level or '',
-                            log.host or '',
-                            log.pid or '',
-                            log.message
-                        ])
-        
+            for entry in self.stream_logs():
+                writer.writerow([
+                    entry.timestamp.isoformat(),
+                    entry.service,
+                    entry.level or '',
+                    entry.host or '',
+                    entry.pid or '',
+                    entry.message
+                ])
         logging.info(f"Exported log data to {filename}")
 
     def find_errors(self, service: Optional[str] = None) -> List[LogEntry]:
@@ -1137,7 +1059,6 @@ class RSyslogAnalyzer:
                 if service and svc != service:
                     continue
                 errors.extend([log for log in logs if log.is_error])
-        
         return sorted(errors, key=lambda x: x.timestamp)
 
     def filter_logs(self, service_pattern: str = None, level: str = None, 
@@ -1173,7 +1094,6 @@ Examples:
   %(prog)s --system-info --no-rsyslog-detection
         """
     )
-    
     parser.add_argument("--log-file", type=str, 
                        help="Path to the syslog file (overrides default search).")
     parser.add_argument("--max-days", type=int, default=30, 
@@ -1220,12 +1140,10 @@ Examples:
                        help="Load configuration from JSON file.")
     parser.add_argument("--version", action="version", 
                        version="RSyslogAnalyzer 4.0.0")
-    
     return parser.parse_args()
 
 def main():
     args = parse_arguments()
-    
     if args.config_file:
         config = AnalyzerConfig.from_file(Path(args.config_file))
     else:
@@ -1242,19 +1160,15 @@ def main():
             max_memory_entries=args.max_memory_entries,
             use_rsyslog_detection=not args.no_rsyslog_detection
         )
-    
     analyzer = RSyslogAnalyzer(
         log_file=args.log_file,
         config=config
     )
-    
     if args.system_info:
         analyzer.display_system_info()
         return
-    
     analyzer.load_logs()
     analyzer.build_tree()
-    
     if args.find_errors:
         errors = analyzer.find_errors(args.service)
         if errors:
@@ -1263,7 +1177,6 @@ def main():
                 print(f"  {error.timestamp} [{error.service}] {error.message[:100]}...")
         else:
             print("No error logs found.")
-    
     elif args.filter_service or args.filter_level or args.filter_message:
         filtered = analyzer.filter_logs(
             service_pattern=args.filter_service,
@@ -1276,16 +1189,12 @@ def main():
                 print(f"  {log.timestamp} [{log.service}] {log.level or 'N/A'}: {log.message[:80]}...")
         else:
             print("No matching logs found.")
-    
     elif args.summary:
         analyzer.display_summary()
-    
     else:
         analyzer.display_tree()
-    
     if args.export:
         analyzer.export_to_json(args.export)
-    
     if args.export_csv:
         analyzer.export_to_csv(args.export_csv)
 
